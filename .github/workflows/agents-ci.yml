@@ -1,0 +1,25 @@
+name: Agents CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - copilot/search-rozetka-marketplace
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Compile Python sources
+        run: python -m compileall agents
+      - name: Run unit tests
+        run: python -m unittest discover -s agents/tests -v
+      - name: Run demo smoke test
+        run: python agents/main.py --demo
