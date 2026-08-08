@@ -5,13 +5,99 @@
 
 import json
 import re
-import time
 import urllib.parse
 import urllib.request
 from datetime import datetime
+from html.parser import HTMLParser
 from typing import Optional
 
 from crewai.tools import tool
+
+
+_ALLOWED_ROZETKA_HOSTS = {"rozetka.com.ua", "www.rozetka.com.ua"}
+
+
+class _JsonLdParser(HTMLParser):
+    """Collect JSON-LD bodies so each name stays paired with its price."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._in_json_ld = False
+        self._parts: list[str] = []
+        self.documents: list[str] = []
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, Optional[str]]]) -> None:
+        if tag.lower() != "script":
+            return
+        attributes = {key.lower(): value for key, value in attrs}
+        script_type = attributes.get("type") or ""
+        self._in_json_ld = script_type.lower() == "application/ld+json"
+        if self._in_json_ld:
+            self._parts = []
+
+    def handle_data(self, data: str) -> None:
+        if self._in_json_ld:
+            self._parts.append(data)
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag.lower() == "script" and self._in_json_ld:
+            self.documents.append("".join(self._parts))
+            self._in_json_ld = False
+            self._parts = []
+
+
+def _walk_json(value: object):
+    if isinstance(value, dict):
+        yield value
+        for child in value.values():
+            yield from _walk_json(child)
+    elif isinstance(value, list):
+        for child in value:
+            yield from _walk_json(child)
+
+
+def _extract_products(html: str, limit: int = 10) -> list[tuple[str, float]]:
+    """Extract name/price pairs from the same structured product object."""
+    parser = _JsonLdParser()
+    parser.feed(html)
+    products: list[tuple[str, float]] = []
+    for document in parser.documents:
+        try:
+            payload = json.loads(document)
+        except json.JSONDecodeError:
+            continue
+        for item in _walk_json(payload):
+            name = item.get("name") or item.get("title")
+            offers = item.get("offers", item)
+            if isinstance(offers, list):
+                offers = offers[0] if offers else {}
+            price = offers.get("price") if isinstance(offers, dict) else None
+            if not name or price is None:
+                continue
+            try:
+                numeric_price = float(str(price).replace(" ", "").replace(",", "."))
+            except ValueError:
+                continue
+            if numeric_price < 0:
+                continue
+            products.append((str(name).strip(), numeric_price))
+            if len(products) >= limit:
+                return products
+    return products
+
+
+def _validate_rozetka_url(category_url: str) -> str:
+    parsed = urllib.parse.urlparse(category_url)
+    hostname = (parsed.hostname or "").lower()
+    if (
+        parsed.scheme != "https"
+        or hostname not in _ALLOWED_ROZETKA_HOSTS
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.port not in (None, 443)
+    ):
+        raise ValueError("дозволені лише HTTPS-посилання на rozetka.com.ua")
+    return category_url
 
 
 # ---------------------------------------------------------------------------
@@ -40,12 +126,8 @@ def search_prom_prices(query: str) -> str:
         with urllib.request.urlopen(req, timeout=10) as response:
             html = response.read().decode("utf-8", errors="ignore")
 
-        prices = re.findall(r'"price":\s*"?(\d+(?:\.\d+)?)"?', html)
-        names = re.findall(r'"name":\s*"([^"]{5,120})"', html)
-
-        results = []
-        for name, price in zip(names[:10], prices[:10]):
-            results.append(f"- {name}: {price} грн")
+        products = _extract_products(html)
+        results = [f"- {name}: {price:g} грн" for name, price in products]
 
         if not results:
             return (
@@ -74,6 +156,8 @@ def analyze_rozetka_competitors(category_url: str) -> str:
             query = urllib.parse.quote(category_url)
             category_url = f"https://rozetka.com.ua/ua/search/?text={query}"
 
+        category_url = _validate_rozetka_url(category_url)
+
         req = urllib.request.Request(
             category_url,
             headers={
@@ -86,17 +170,8 @@ def analyze_rozetka_competitors(category_url: str) -> str:
         with urllib.request.urlopen(req, timeout=10) as response:
             html = response.read().decode("utf-8", errors="ignore")
 
-        prices = re.findall(r'"price":\s*(\d+)', html)
-        names = re.findall(
-            r'"title":\s*"([^"]{5,100})"', html
-        ) or re.findall(
-            r'<span[^>]*class="[^"]*goods-tile__title[^"]*"[^>]*>([^<]{5,100})',
-            html,
-        )
-
-        results = []
-        for name, price in zip(names[:10], prices[:10]):
-            results.append(f"- {name.strip()}: {price} грн")
+        products = _extract_products(html)
+        results = [f"- {name}: {price:g} грн" for name, price in products]
 
         if not results:
             return (
@@ -104,7 +179,7 @@ def analyze_rozetka_competitors(category_url: str) -> str:
                 "Спробуй ввести конкретний запит або перевір URL."
             )
 
-        avg = sum(int(p) for p in prices[:10]) / max(len(prices[:10]), 1)
+        avg = sum(price for _, price in products) / len(products)
         return (
             f"Топ товари на Rozetka:\n"
             + "\n".join(results)
@@ -207,6 +282,13 @@ def calculate_margin(
         sell = float(selling_price)
         buy = float(purchase_price)
         fee_pct = float(marketplace_fee_percent or 15)
+
+        if sell <= 0:
+            raise ValueError("ціна продажу має бути більшою за нуль")
+        if buy < 0:
+            raise ValueError("ціна закупівлі не може бути від’ємною")
+        if not 0 <= fee_pct <= 100:
+            raise ValueError("комісія має бути в межах від 0 до 100%")
 
         fee_amount = sell * fee_pct / 100
         profit = sell - buy - fee_amount
@@ -373,6 +455,13 @@ def generate_ad_budget_plan(total_budget: str, sku_count: str) -> str:
     try:
         budget = float(total_budget)
         skus = int(sku_count)
+
+        if budget < 0:
+            raise ValueError("бюджет не може бути від’ємним")
+        if skus < 3:
+            raise ValueError(
+                "для розподілу між трьома групами потрібно щонайменше 3 SKU"
+            )
 
         proven_budget = budget * 0.60
         new_budget = budget * 0.25
