@@ -1,0 +1,42 @@
+name: tmp-giblab-fetch
+
+on:
+  push:
+    branches:
+      - tmp/giblab-tools-20260829
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Download official GibLab resources
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p out
+          UA='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/151 Safari/537.36'
+          curl -k -A "$UA" --fail --location --retry 4 --connect-timeout 30 --max-time 240 \
+            'https://giblab.com/download/GibSawInstall.exe' \
+            -o out/GibSawInstall.exe
+          curl -k -A "$UA" --fail --location --retry 4 --connect-timeout 30 --max-time 240 \
+            'https://service.giblab.com/download/GibServiceTestNpp.zip' \
+            -o out/GibServiceTestNpp.zip || true
+          curl -k -A "$UA" --fail --location --retry 4 --connect-timeout 30 --max-time 240 \
+            'https://service.giblab.com/pages/help/examples/TestGibService.java' \
+            -o out/TestGibService.java || true
+          test -s out/GibSawInstall.exe
+          file out/* | tee out/file-types.txt
+          sha256sum out/* | tee out/SHA256SUMS.txt
+          ls -lah out | tee out/listing.txt
+      - name: Publish temporary artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: giblab-tools
+          path: out/
+          if-no-files-found: error
+          retention-days: 1
