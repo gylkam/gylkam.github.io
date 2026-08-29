@@ -23,7 +23,7 @@ jobs:
         run: |
           set -euxo pipefail
           sudo apt-get update -qq
-          sudo apt-get install -y -qq p7zip-full unzip zip file binutils
+          sudo apt-get install -y -qq p7zip-full unzip zip file binutils libarchive-tools
           rm -rf _giblab_work tmp-giblab-artifacts
           mkdir -p _giblab_work/download _giblab_work/gibsaw _giblab_work/service tmp-giblab-artifacts
           UA='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/151 Safari/537.36'
@@ -33,7 +33,19 @@ jobs:
           curl -k -A "$UA" --fail --location --retry 4 --connect-timeout 30 --max-time 240 \
             'https://service.giblab.com/download/GibServiceTestNpp.zip' \
             -o _giblab_work/download/GibServiceTestNpp.zip
-          7z x -y _giblab_work/download/GibSawInstall.exe -o_giblab_work/gibsaw
+          python3 - <<'PY'
+          from pathlib import Path
+          source = Path('_giblab_work/download/GibSawInstall.exe').read_bytes()
+          signatures = (b'Rar!\x1a\x07\x01\x00', b'Rar!\x1a\x07\x00')
+          offsets = [(source.find(sig), sig) for sig in signatures if source.find(sig) >= 0]
+          if not offsets:
+              raise SystemExit('RAR signature not found in SFX')
+          offset, signature = min(offsets)
+          Path('_giblab_work/download/GibSawInstall.rar').write_bytes(source[offset:])
+          print(f'RAR signature={signature!r} offset={offset} archive_bytes={len(source)-offset}')
+          PY
+          7z t _giblab_work/download/GibSawInstall.rar
+          7z x -y _giblab_work/download/GibSawInstall.rar -o_giblab_work/gibsaw
           unzip -o _giblab_work/download/GibServiceTestNpp.zip -d _giblab_work/service
           find _giblab_work -type f -printf '%s\t%p\n' | sort -n > tmp-giblab-artifacts/files.tsv
           find _giblab_work -type f -exec file {} + > tmp-giblab-artifacts/file-types.txt
